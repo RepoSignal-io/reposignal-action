@@ -1,0 +1,21 @@
+# .github/workflows/reposignal.yml
+# Add this to your repo to get RepoSignal risk scores on every PR.
+# Get your API key at https://reposignal.io
+
+name: RepoSignal Risk Analysis
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  reposignal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: RepoSignal-io/reposignal-action@v1
+        with:
+          api-key: ${{ secrets.REPOSIGNAL_API_KEY }}
+          # Optional: fail PR if risk score exceeds threshold
+          # threshold: '8'

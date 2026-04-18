@@ -1,0 +1,88 @@
+name: 'RepoSignal — Commit Risk Analysis'
+description: 'Repository-calibrated pull request risk analysis. Ranks PRs by historical revert patterns, detects code risk patterns, and posts review guidance.'
+author: 'RepoSignal'
+
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  api-key:
+    description: 'Your RepoSignal API key (get one at reposignal.io)'
+    required: true
+  api-url:
+    description: 'RepoSignal API endpoint'
+    required: false
+    default: 'https://reposignal.onrender.com'
+  threshold:
+    description: 'Score threshold to fail the check (0 = never fail). Recommended only for strong-signal repos. For ranking-type repos, use RepoSignal for prioritization, not blocking.'
+    required: false
+    default: '0'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Get PR diff
+      id: diff
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        DIFF=$(gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }})
+        # Save to file to handle large diffs
+        echo "$DIFF" > /tmp/pr_diff.txt
+        echo "size=$(wc -c < /tmp/pr_diff.txt)" >> $GITHUB_OUTPUT
+
+    - name: Analyze with RepoSignal
+      id: analyze
+      shell: bash
+      run: |
+        RESPONSE=$(curl -s -X POST "${{ inputs.api-url }}/api/v1/github" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d @- <<EOF
+        {
+          "diff": $(python3 -c "import json; print(json.dumps(open('/tmp/pr_diff.txt').read()[:500000]))"),
+          "commit_sha": "${{ github.event.pull_request.head.sha }}",
+          "commit_message": $(python3 -c "import json; print(json.dumps('''${{ github.event.pull_request.title }}'''[:200]))"),
+          "repo": "${{ github.repository }}",
+          "pr_number": ${{ github.event.pull_request.number }}
+        }
+        EOF
+        )
+
+        SCORE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('score',0))")
+        COMMENT=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('comment_markdown','Analysis failed.'))")
+        THRESHOLD_ALLOWED=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('threshold_allowed',False))")
+
+        echo "score=$SCORE" >> $GITHUB_OUTPUT
+        echo "threshold_allowed=$THRESHOLD_ALLOWED" >> $GITHUB_OUTPUT
+        echo "$COMMENT" > /tmp/efa_comment.md
+
+    - name: Post PR comment
+      shell: bash
+      run: |
+        gh pr comment ${{ github.event.pull_request.number }} \
+          --repo ${{ github.repository }} \
+          --body-file /tmp/efa_comment.md
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Check threshold
+      if: inputs.threshold != '0'
+      shell: bash
+      run: |
+        SCORE=${{ steps.analyze.outputs.score }}
+        THRESHOLD=${{ inputs.threshold }}
+        THRESHOLD_ALLOWED=${{ steps.analyze.outputs.threshold_allowed }}
+
+        # Only enforce threshold when the API explicitly says it's safe
+        if [ "$THRESHOLD_ALLOWED" != "True" ]; then
+          echo "::notice::RepoSignal threshold not enforced for this repo. Thresholds are only applied for calibrated strong-signal repos."
+          exit 0
+        fi
+
+        if (( $(echo "$SCORE > $THRESHOLD" | bc -l) )); then
+          echo "::error::RepoSignal risk score $SCORE exceeds threshold $THRESHOLD"
+          exit 1
+        fi
